@@ -1,0 +1,17 @@
+=== 提交文件统计报告 ===
+生成时间: 2025-10-28 13:51:52
+测试文件总数: 1140
+提交文件路径: artifacts/final_submission\submit.txt
+
+各类别预测分布:
+  normal: 65 (5.70%)
+  inner_broken: 85 (7.46%)
+  inner_wear: 331 (29.04%)
+  outer_broken: 177 (15.53%)
+  outer_missing: 205 (17.98%)
+  roller_broken: 277 (24.30%)
+  roller_wear: 0 (0.00%)
+
+文件格式: TXT (制表符分隔)
+列名: 测试集名称, 故障类型
+测试集名称格式: test0001, test0002, ..., test1140

@@ -1,0 +1,8 @@
+{
+  "inner_broken": 0,
+  "inner_wear": 1,
+  "normal_train160": 2,
+  "outer_missing": 3,
+  "roller_broken": 4,
+  "roller_wear": 5
+}

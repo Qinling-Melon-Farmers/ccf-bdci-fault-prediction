@@ -1,0 +1,41 @@
+测试提交文件生成报告
+==================================================
+生成时间: 2025-10-28 22:18:32.188398
+输出目录: artifacts/test_submissions
+测试样本总数: 1140
+
+生成的文件列表:
+1. test_submission_inner_broken.txt
+   - 故障类型: inner_broken
+   - 样本数量: 1140
+
+2. test_submission_inner_wear.txt
+   - 故障类型: inner_wear
+   - 样本数量: 1140
+
+3. test_submission_normal.txt
+   - 故障类型: normal
+   - 样本数量: 1140
+
+4. test_submission_outer_missing.txt
+   - 故障类型: outer_missing
+   - 样本数量: 1140
+
+5. test_submission_roller_broken.txt
+   - 故障类型: roller_broken
+   - 样本数量: 1140
+
+6. test_submission_roller_wear.txt
+   - 故障类型: roller_wear
+   - 样本数量: 1140
+
+文件格式说明:
+- 列分隔符: Tab (\t)
+- 编码格式: UTF-8
+- 列名: ['测试集名称', '故障类型']
+- 测试集名称格式: test0001 ~ test1140
+
+用途说明:
+- 测试测试集分布
+- 验证提交文件格式
+- 分析各故障类型的预测效果

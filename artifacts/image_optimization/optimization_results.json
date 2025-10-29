@@ -1,0 +1,227 @@
+{
+  "best_params": {
+    "learning_rate": 0.002,
+    "batch_size": 64,
+    "epochs": 20,
+    "model_type": "efficientnet_b0",
+    "optimizer_type": "sgd",
+    "weight_decay": 0.0001,
+    "scheduler_factor": 0.7,
+    "scheduler_patience": 7,
+    "augmentation_strength": "light"
+  },
+  "best_accuracy": 35.174418604651166,
+  "all_results": [
+    {
+      "params": {
+        "learning_rate": 0.002,
+        "batch_size": 64,
+        "epochs": 20,
+        "model_type": "efficientnet_b0",
+        "optimizer_type": "sgd",
+        "weight_decay": 0.0001,
+        "scheduler_factor": 0.7,
+        "scheduler_patience": 7,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 35.174418604651166
+    },
+    {
+      "params": {
+        "learning_rate": 0.001,
+        "batch_size": 64,
+        "epochs": 30,
+        "model_type": "resnet50",
+        "optimizer_type": "sgd",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 3,
+        "augmentation_strength": "strong"
+      },
+      "val_acc": 33.72093023255814
+    },
+    {
+      "params": {
+        "learning_rate": 0.001,
+        "batch_size": 64,
+        "epochs": 50,
+        "model_type": "efficientnet_b0",
+        "optimizer_type": "adam",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 3,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 31.976744186046513
+    },
+    {
+      "params": {
+        "learning_rate": 0.0005,
+        "batch_size": 16,
+        "epochs": 30,
+        "model_type": "resnet50",
+        "optimizer_type": "adamw",
+        "weight_decay": 0.001,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 3,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 32.26744186046512
+    },
+    {
+      "params": {
+        "learning_rate": 0.0005,
+        "batch_size": 32,
+        "epochs": 20,
+        "model_type": "resnet18",
+        "optimizer_type": "sgd",
+        "weight_decay": 0.001,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 3,
+        "augmentation_strength": "medium"
+      },
+      "val_acc": 34.593023255813954
+    },
+    {
+      "params": {
+        "learning_rate": 0.002,
+        "batch_size": 64,
+        "epochs": 20,
+        "model_type": "efficientnet_b0",
+        "optimizer_type": "adam",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.7,
+        "scheduler_patience": 3,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 33.72093023255814
+    },
+    {
+      "params": {
+        "learning_rate": 0.001,
+        "batch_size": 32,
+        "epochs": 20,
+        "model_type": "resnet18",
+        "optimizer_type": "sgd",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 5,
+        "augmentation_strength": "medium"
+      },
+      "val_acc": 30.232558139534884
+    },
+    {
+      "params": {
+        "learning_rate": 0.005,
+        "batch_size": 32,
+        "epochs": 50,
+        "model_type": "resnet18",
+        "optimizer_type": "adam",
+        "weight_decay": 0.001,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 7,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 22.093023255813954
+    },
+    {
+      "params": {
+        "learning_rate": 0.0005,
+        "batch_size": 64,
+        "epochs": 50,
+        "model_type": "resnet50",
+        "optimizer_type": "adam",
+        "weight_decay": 0.001,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 5,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 34.01162790697674
+    },
+    {
+      "params": {
+        "learning_rate": 0.0005,
+        "batch_size": 32,
+        "epochs": 50,
+        "model_type": "resnet50",
+        "optimizer_type": "adamw",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 3,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 34.30232558139535
+    },
+    {
+      "params": {
+        "learning_rate": 0.0001,
+        "batch_size": 32,
+        "epochs": 50,
+        "model_type": "resnet50",
+        "optimizer_type": "sgd",
+        "weight_decay": 0.0001,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 5,
+        "augmentation_strength": "medium"
+      },
+      "val_acc": 30.523255813953487
+    },
+    {
+      "params": {
+        "learning_rate": 0.0005,
+        "batch_size": 64,
+        "epochs": 30,
+        "model_type": "resnet50",
+        "optimizer_type": "adamw",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 5,
+        "augmentation_strength": "strong"
+      },
+      "val_acc": 33.72093023255814
+    },
+    {
+      "params": {
+        "learning_rate": 0.001,
+        "batch_size": 16,
+        "epochs": 50,
+        "model_type": "resnet18",
+        "optimizer_type": "sgd",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 3,
+        "augmentation_strength": "medium"
+      },
+      "val_acc": 31.686046511627907
+    },
+    {
+      "params": {
+        "learning_rate": 0.002,
+        "batch_size": 32,
+        "epochs": 20,
+        "model_type": "efficientnet_b0",
+        "optimizer_type": "adam",
+        "weight_decay": 1e-05,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 5,
+        "augmentation_strength": "light"
+      },
+      "val_acc": 30.813953488372093
+    },
+    {
+      "params": {
+        "learning_rate": 0.005,
+        "batch_size": 16,
+        "epochs": 20,
+        "model_type": "resnet18",
+        "optimizer_type": "adam",
+        "weight_decay": 0.001,
+        "scheduler_factor": 0.3,
+        "scheduler_patience": 3,
+        "augmentation_strength": "strong"
+      },
+      "val_acc": 32.26744186046512
+    }
+  ],
+  "optimization_time": "2025-10-28T06:00:02.964005"
+}

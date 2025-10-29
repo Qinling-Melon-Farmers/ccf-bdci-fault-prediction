@@ -1,0 +1,29 @@
+图像模型超参数优化报告
+==============================
+
+原始模型性能:
+- 验证准确率: 34.01%
+- 批次大小: 16
+- 学习率: 0.001
+- 训练轮数: 10
+
+优化后最佳参数:
+- learning_rate: 0.002
+- batch_size: 64
+- epochs: 20
+- model_type: efficientnet_b0
+- optimizer_type: sgd
+- weight_decay: 0.0001
+- scheduler_factor: 0.7
+- scheduler_patience: 7
+- augmentation_strength: light
+
+优化后最佳验证准确率: 35.17%
+性能提升: 1.16%
+
+前5个最佳结果:
+1. 准确率: 35.17% - {'learning_rate': 0.002, 'batch_size': 64, 'epochs': 20, 'model_type': 'efficientnet_b0', 'optimizer_type': 'sgd', 'weight_decay': 0.0001, 'scheduler_factor': 0.7, 'scheduler_patience': 7, 'augmentation_strength': 'light'}
+2. 准确率: 34.59% - {'learning_rate': 0.0005, 'batch_size': 32, 'epochs': 20, 'model_type': 'resnet18', 'optimizer_type': 'sgd', 'weight_decay': 0.001, 'scheduler_factor': 0.5, 'scheduler_patience': 3, 'augmentation_strength': 'medium'}
+3. 准确率: 34.30% - {'learning_rate': 0.0005, 'batch_size': 32, 'epochs': 50, 'model_type': 'resnet50', 'optimizer_type': 'adamw', 'weight_decay': 1e-05, 'scheduler_factor': 0.5, 'scheduler_patience': 3, 'augmentation_strength': 'light'}
+4. 准确率: 34.01% - {'learning_rate': 0.0005, 'batch_size': 64, 'epochs': 50, 'model_type': 'resnet50', 'optimizer_type': 'adam', 'weight_decay': 0.001, 'scheduler_factor': 0.5, 'scheduler_patience': 5, 'augmentation_strength': 'light'}
+5. 准确率: 33.72% - {'learning_rate': 0.001, 'batch_size': 64, 'epochs': 30, 'model_type': 'resnet50', 'optimizer_type': 'sgd', 'weight_decay': 1e-05, 'scheduler_factor': 0.3, 'scheduler_patience': 3, 'augmentation_strength': 'strong'}
