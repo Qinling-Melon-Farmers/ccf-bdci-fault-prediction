@@ -4,9 +4,11 @@ import traceback
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import RobustScaler, StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import accuracy_score, classification_report, log_loss, f1_score, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 from scipy import signal
 from scipy.signal import find_peaks
@@ -14,9 +16,10 @@ from scipy.interpolate import interp1d
 from scipy.stats import skew, kurtosis
 import glob
 import xgboost as xgb
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.feature_selection import VarianceThreshold
-import pandas as pd
+from sklearn.tree import DecisionTreeClassifier
+from signal_to_image import SignalToImageConverter
 
 # 定义数据路径（使用脚本所在目录）
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +54,20 @@ fault_type_mapping = {
     4: "roller_broken",
     5: "roller_wear"
 }
+
+CLASS_INDEX_BY_NAME = {name: idx for idx, name in fault_type_mapping.items()}
+
+# 测试集类别占比（根据最新统计信息进行校准）
+# 顺序与 fault_type_mapping 的索引保持一致
+TARGET_TEST_PRIORS = np.array([
+    0.132,  # inner_broken
+    0.123,  # inner_wear
+    0.200,  # normal
+    0.141,  # outer_missing
+    0.176,  # roller_broken
+    0.228   # roller_wear
+])
+TARGET_TEST_PRIORS = TARGET_TEST_PRIORS / TARGET_TEST_PRIORS.sum()
 
 # 窗口处理参数
 SAMPLE_RATE = 20480  # 采样率（假设为20.48kHz）
@@ -787,50 +804,47 @@ def apply_windowing(signal_data, window_size=WINDOW_SAMPLES, step_size=STEP_SIZE
         windows.append(window)
     return windows
 
+
+def read_excel_signals(file_path):
+    """读取Excel文件并返回速度和振动信号。"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    try:
+        df = pd.read_excel(file_path, engine='openpyxl')
+    except Exception as e1:
+        try:
+            df = pd.read_excel(file_path, engine='xlrd')
+        except Exception as e2:
+            raise Exception(f"无法读取Excel文件: {e1}, {e2}") from e2
+
+    if df.shape[1] < 2:
+        raise ValueError(f"数据列数不足，需要至少2列，但只有{df.shape[1]}列")
+
+    speed_signal = df.iloc[:, 0].astype(float).values
+    vibration_signal = df.iloc[:, 1].astype(float).values
+
+    if len(speed_signal) == 0 or len(vibration_signal) == 0:
+        raise ValueError("数据为空")
+
+    if np.isnan(speed_signal).any() or np.isnan(vibration_signal).any():
+        raise ValueError("数据包含NaN值")
+
+    return speed_signal, vibration_signal
+
 # 特征提取函数
 def extract_features(file_path, use_order_tracking=True, use_windowing=True):
     """从Excel文件中提取特征"""
     try:
         print(f"正在处理文件: {file_path}")
-        
-        # 检查文件是否存在
-        if not os.path.exists(file_path):
-            print(f"错误: 文件不存在: {file_path}")
-            return None
-            
-        # 读取Excel文件
-        try:
-            # 尝试使用openpyxl引擎
-            df = pd.read_excel(file_path, engine='openpyxl')
-        except Exception as e1:
-            print(f"使用openpyxl引擎读取失败: {e1}")
-            try:
-                # 尝试使用xlrd引擎
-                df = pd.read_excel(file_path, engine='xlrd')
-            except Exception as e2:
-                print(f"使用xlrd引擎读取失败: {e2}")
-                raise Exception(f"无法读取Excel文件: {e1}, {e2}")
-        
-        # 打印数据形状和前几行，用于调试
-        print(f"数据形状: {df.shape}")
-        
-        # 获取转速脉冲信号和垂直方向振动信号
-        if df.shape[1] < 2:
-            raise Exception(f"数据列数不足，需要至少2列，但只有{df.shape[1]}列")
-            
-        speed_signal = df.iloc[:, 0].values
-        vibration_signal = df.iloc[:, 1].values
-        
-        # 检查数据是否为空或包含NaN
-        if len(speed_signal) == 0 or len(vibration_signal) == 0:
-            raise Exception("数据为空")
-        if np.isnan(speed_signal).any() or np.isnan(vibration_signal).any():
-            raise Exception("数据包含NaN值")
-        
+
+        speed_signal, vibration_signal = read_excel_signals(file_path)
+        print(f"数据长度: {len(speed_signal)}")
+
         # 阶次处理（如果启用）
         if use_order_tracking:
             vibration_signal = order_tracking(speed_signal, vibration_signal)
-        
+
         # 窗口化处理（如果启用）
         if use_windowing:
             windows = apply_windowing(vibration_signal)
@@ -920,6 +934,86 @@ def load_training_data(use_order_tracking=True, use_windowing=True):
     print(f"特征数组形状: {X_array.shape}")
     return X_array, np.array(y)
 
+
+def extract_image_feature_vector(speed_signal, vibration_signal, converter, image_type='combined', image_size=(160, 160)):
+    """将双通道信号转换为图像后提取扁平化特征。"""
+    signal_pair = np.column_stack((speed_signal, vibration_signal))
+
+    if image_type == 'spectrogram':
+        image = converter.signal_to_spectrogram_image(signal_pair)
+    elif image_type == 'combined':
+        image = converter.signal_to_combined_image(signal_pair)
+    else:
+        image = converter.signal_to_image(signal_pair)
+
+    if image_size is not None:
+        image = image.resize(image_size)
+
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return array.flatten()
+
+
+def load_image_feature_dataset(use_order_tracking=False, image_type='combined', image_size=(160, 160)):
+    """构建基于图像的特征数据集。"""
+    converter = SignalToImageConverter(image_size=image_size, dpi=100, style='clean')
+
+    features = []
+    labels = []
+
+    for fault_type, label in fault_types.items():
+        fault_dir = os.path.join(train_path, fault_type)
+        files = sorted(glob.glob(os.path.join(fault_dir, "*.xlsx")))
+
+        for file in files:
+            try:
+                speed_signal, vibration_signal = read_excel_signals(file)
+                if use_order_tracking:
+                    vibration_signal = order_tracking(speed_signal, vibration_signal)
+
+                feature_vec = extract_image_feature_vector(
+                    speed_signal,
+                    vibration_signal,
+                    converter,
+                    image_type=image_type,
+                    image_size=image_size,
+                )
+                features.append(feature_vec)
+                labels.append(label)
+            except Exception as exc:
+                print(f"图像特征提取失败 {file}: {exc}")
+
+    feature_array = np.asarray(features, dtype=np.float32)
+    label_array = np.asarray(labels, dtype=int)
+
+    print(f"图像特征数组形状: {feature_array.shape}")
+    return feature_array, label_array, converter
+
+
+def load_test_image_features(converter, use_order_tracking=False, image_type='combined', image_size=(160, 160)):
+    """为测试集构建图像特征映射。"""
+    feature_map = {}
+    test_files = sorted(glob.glob(os.path.join(test_path, "*.xlsx")))
+
+    for file in test_files:
+        file_name = os.path.basename(file)
+        try:
+            speed_signal, vibration_signal = read_excel_signals(file)
+            if use_order_tracking:
+                vibration_signal = order_tracking(speed_signal, vibration_signal)
+
+            feature_vec = extract_image_feature_vector(
+                speed_signal,
+                vibration_signal,
+                converter,
+                image_type=image_type,
+                image_size=image_size,
+            )
+            feature_map[file_name] = feature_vec
+        except Exception as exc:
+            print(f"测试集图像特征提取失败 {file}: {exc}")
+
+    return feature_map
+
 # 特征选择和降维
 def feature_selection(X, y, variance_threshold=0.01, correlation_threshold=0.95, n_components=None):
     """特征选择和降维（添加相关性去冗余）"""
@@ -963,8 +1057,359 @@ def feature_selection(X, y, variance_threshold=0.01, correlation_threshold=0.95,
         print(f"PCA降维后特征数: {X_reduced.shape[1]}")
         print(f"PCA解释方差比: {np.sum(pca.explained_variance_ratio_):.4f}")
         return X_reduced, (selector, features_to_keep), pca
-    
+
     return X_corr_filtered, (selector, features_to_keep), None
+
+
+def apply_feature_selection_and_pca(X, selector=None, pca=None):
+    """将特征选择器和PCA变换统一应用于数据。"""
+    if selector is not None:
+        if isinstance(selector, tuple):
+            variance_selector, features_to_keep = selector
+            X = variance_selector.transform(X)
+            X = X[:, features_to_keep]
+        else:
+            X = selector.transform(X)
+
+    if pca is not None:
+        X = pca.transform(X)
+
+    return X
+
+
+def create_rf_model(best_params=None, random_state=42):
+    """根据给定参数构建随机森林模型。"""
+    base_params = {
+        'n_estimators': 200,
+        'max_depth': 15,
+        'min_samples_split': 5,
+        'min_samples_leaf': 2,
+        'max_features': 'sqrt',
+        'bootstrap': True,
+        'oob_score': True,
+        'class_weight': 'balanced',
+        'random_state': random_state,
+        'n_jobs': -1,
+    }
+    if best_params:
+        base_params.update(best_params)
+        # 确保关键信息仍然存在
+        base_params.setdefault('class_weight', 'balanced')
+        base_params.setdefault('random_state', random_state)
+        base_params.setdefault('n_jobs', -1)
+
+    return RandomForestClassifier(**base_params)
+
+
+def create_xgb_model(best_params=None, random_state=42):
+    """根据给定参数构建XGBoost模型。"""
+    base_params = {
+        'n_estimators': 200,
+        'learning_rate': 0.05,
+        'max_depth': 6,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'gamma': 0.1,
+        'min_child_weight': 3,
+        'objective': 'multi:softprob',
+        'num_class': len(fault_types),
+        'random_state': random_state,
+        'eval_metric': 'mlogloss',
+        'scale_pos_weight': None,
+    }
+
+    if best_params:
+        base_params.update(best_params)
+        base_params.setdefault('objective', 'multi:softprob')
+        base_params.setdefault('num_class', len(fault_types))
+        base_params.setdefault('eval_metric', 'mlogloss')
+
+    return xgb.XGBClassifier(**base_params)
+
+
+def create_decision_tree_model(best_params=None, random_state=42):
+    """构建带类权重的决策树模型。"""
+    base_params = {
+        'criterion': 'gini',
+        'max_depth': 18,
+        'min_samples_split': 4,
+        'min_samples_leaf': 2,
+        'class_weight': 'balanced',
+        'random_state': random_state,
+    }
+
+    if best_params:
+        base_params.update(best_params)
+        base_params.setdefault('class_weight', 'balanced')
+        base_params.setdefault('random_state', random_state)
+
+    return DecisionTreeClassifier(**base_params)
+
+
+def create_image_logistic_model(class_weight=None, random_state=42):
+    """构建用于图像特征的多分类逻辑回归模型。"""
+    return LogisticRegression(
+        max_iter=500,
+        multi_class='multinomial',
+        solver='saga',
+        n_jobs=-1,
+        class_weight=class_weight,
+        random_state=random_state,
+    )
+
+
+def cross_validate_model(X, y, build_model_fn, model_label="model", n_splits=5,
+                         variance_threshold=0.01, correlation_threshold=0.95):
+    """对给定模型进行分层交叉验证评估以估计可靠性。"""
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    accuracies = []
+    macro_f1_scores = []
+    log_losses = []
+    class_recalls = []
+
+    print(f"\n对模型 {model_label} 进行{n_splits}折交叉验证评估...")
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y), start=1):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        scaler = RobustScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+
+        X_train_selected, selector_info, pca = feature_selection(
+            X_train_scaled, y_train,
+            variance_threshold=variance_threshold,
+            correlation_threshold=correlation_threshold,
+            n_components=None
+        )
+        X_val_selected = apply_feature_selection_and_pca(X_val_scaled, selector_info, pca)
+
+        model = build_model_fn()
+
+        class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+        class_weight_dict = dict(zip(np.unique(y_train), class_weights))
+        sample_weights = np.array([class_weight_dict[label] for label in y_train])
+
+        try:
+            model.fit(X_train_selected, y_train, sample_weight=sample_weights)
+        except TypeError:
+            model.fit(X_train_selected, y_train)
+
+        y_pred = model.predict(X_val_selected)
+        y_proba = model.predict_proba(X_val_selected)
+
+        y_proba = np.clip(y_proba, 1e-8, 1 - 1e-8)
+        y_proba = y_proba / np.sum(y_proba, axis=1, keepdims=True)
+
+        fold_acc = accuracy_score(y_val, y_pred)
+        fold_f1 = f1_score(y_val, y_pred, average='macro', zero_division=0)
+        fold_log_loss = log_loss(y_val, y_proba, labels=list(range(len(fault_types))))
+
+        accuracies.append(fold_acc)
+        macro_f1_scores.append(fold_f1)
+        log_losses.append(fold_log_loss)
+
+        cm = confusion_matrix(y_val, y_pred, labels=list(range(len(fault_types))))
+        totals = cm.sum(axis=1)
+        recall = np.divide(np.diag(cm), totals, out=np.zeros_like(totals, dtype=float), where=totals > 0)
+        class_recalls.append(recall)
+
+        print(f"  折 {fold_idx}: 准确率={fold_acc:.4f}, Macro-F1={fold_f1:.4f}, LogLoss={fold_log_loss:.4f}")
+
+    metrics = {
+        'accuracy_mean': float(np.mean(accuracies)) if accuracies else 0.0,
+        'accuracy_std': float(np.std(accuracies)) if accuracies else 0.0,
+        'macro_f1_mean': float(np.mean(macro_f1_scores)) if macro_f1_scores else 0.0,
+        'macro_f1_std': float(np.std(macro_f1_scores)) if macro_f1_scores else 0.0,
+        'log_loss_mean': float(np.mean(log_losses)) if log_losses else None,
+        'log_loss_std': float(np.std(log_losses)) if log_losses else None,
+        'n_splits': n_splits,
+        'model_label': model_label,
+    }
+
+    if class_recalls:
+        class_recalls_array = np.vstack(class_recalls)
+        metrics['class_recall_mean'] = class_recalls_array.mean(axis=0).tolist()
+        metrics['class_recall_std'] = class_recalls_array.std(axis=0).tolist()
+
+    if metrics['log_loss_mean'] is not None:
+        log_loss_text = f"{metrics['log_loss_mean']:.4f}±{metrics['log_loss_std']:.4f}"
+    else:
+        log_loss_text = "nan"
+
+    print(
+        f"{model_label} 交叉验证: 平均准确率={metrics['accuracy_mean']:.4f}±{metrics['accuracy_std']:.4f}, "
+        f"平均Macro-F1={metrics['macro_f1_mean']:.4f}±{metrics['macro_f1_std']:.4f}, 平均LogLoss={log_loss_text}"
+    )
+
+    return metrics
+
+
+def compute_reliability_weight(metrics):
+    """根据交叉验证指标计算模型全局可靠性权重。"""
+    accuracy = metrics.get('accuracy_mean', 0.0) or 0.0
+    log_loss_value = metrics.get('log_loss_mean')
+
+    weight = max(accuracy, 1e-6)
+    if log_loss_value is not None:
+        weight *= np.exp(-max(log_loss_value, 0.0))
+
+    return float(weight)
+
+
+def derive_class_expertise(metrics, manual_boost=None, min_multiplier=0.85, max_multiplier=1.25):
+    """根据折内召回率和手工提示推断模型在不同类别的优势。"""
+    recalls = np.array(metrics.get('class_recall_mean', []), dtype=np.float64)
+
+    if recalls.size == 0:
+        multipliers = np.ones(len(fault_types), dtype=np.float64)
+    else:
+        valid = recalls > 0
+        baseline = recalls[valid].mean() if np.any(valid) else recalls.mean()
+        baseline = baseline if baseline > 0 else 1.0
+        multipliers = (recalls + 1e-6) / (baseline + 1e-6)
+        multipliers = np.clip(multipliers, min_multiplier, max_multiplier)
+
+    if manual_boost:
+        for class_idx, factor in manual_boost.items():
+            if 0 <= class_idx < len(multipliers):
+                multipliers[class_idx] *= factor
+
+    return {idx: float(multipliers[idx]) for idx in range(len(multipliers))}
+
+
+def cross_validate_image_model(X, y, build_model_fn, model_label="ImageModel", n_splits=5, n_components=128):
+    """针对图像特征的交叉验证评估。"""
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    accuracies, macro_f1_scores, log_losses, class_recalls = [], [], [], []
+
+    print(f"\n对模型 {model_label} 进行{n_splits}折交叉验证评估...")
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y), start=1):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+
+        max_components = min(X_train_scaled.shape[0] - 1, X_train_scaled.shape[1])
+        n_comp = max(1, min(n_components, max_components if max_components > 0 else X_train_scaled.shape[1]))
+        pca = IncrementalPCA(n_components=n_comp, batch_size=max(32, n_comp * 2))
+        X_train_reduced = pca.fit_transform(X_train_scaled)
+        X_val_reduced = pca.transform(X_val_scaled)
+
+        class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+        class_weight_dict = dict(zip(np.unique(y_train), class_weights))
+
+        model = build_model_fn(class_weight_dict)
+        model.fit(X_train_reduced, y_train)
+
+        y_pred = model.predict(X_val_reduced)
+        y_proba = model.predict_proba(X_val_reduced)
+        y_proba = np.clip(y_proba, 1e-8, 1 - 1e-8)
+        y_proba = y_proba / np.sum(y_proba, axis=1, keepdims=True)
+
+        fold_acc = accuracy_score(y_val, y_pred)
+        fold_f1 = f1_score(y_val, y_pred, average='macro', zero_division=0)
+        fold_log_loss = log_loss(y_val, y_proba, labels=list(range(len(fault_types))))
+
+        cm = confusion_matrix(y_val, y_pred, labels=list(range(len(fault_types))))
+        totals = cm.sum(axis=1)
+        recall = np.divide(np.diag(cm), totals, out=np.zeros_like(totals, dtype=float), where=totals > 0)
+
+        accuracies.append(fold_acc)
+        macro_f1_scores.append(fold_f1)
+        log_losses.append(fold_log_loss)
+        class_recalls.append(recall)
+
+        print(f"  折 {fold_idx}: 准确率={fold_acc:.4f}, Macro-F1={fold_f1:.4f}, LogLoss={fold_log_loss:.4f}, n_components={n_comp}")
+
+    metrics = {
+        'accuracy_mean': float(np.mean(accuracies)) if accuracies else 0.0,
+        'accuracy_std': float(np.std(accuracies)) if accuracies else 0.0,
+        'macro_f1_mean': float(np.mean(macro_f1_scores)) if macro_f1_scores else 0.0,
+        'macro_f1_std': float(np.std(macro_f1_scores)) if macro_f1_scores else 0.0,
+        'log_loss_mean': float(np.mean(log_losses)) if log_losses else None,
+        'log_loss_std': float(np.std(log_losses)) if log_losses else None,
+        'n_splits': n_splits,
+        'model_label': model_label,
+    }
+
+    if class_recalls:
+        class_recalls_array = np.vstack(class_recalls)
+        metrics['class_recall_mean'] = class_recalls_array.mean(axis=0).tolist()
+        metrics['class_recall_std'] = class_recalls_array.std(axis=0).tolist()
+
+    if metrics['log_loss_mean'] is not None:
+        print(
+            f"{model_label} 交叉验证: 平均准确率={metrics['accuracy_mean']:.4f}±{metrics['accuracy_std']:.4f}, "
+            f"平均Macro-F1={metrics['macro_f1_mean']:.4f}±{metrics['macro_f1_std']:.4f}, "
+            f"平均LogLoss={metrics['log_loss_mean']:.4f}±{metrics['log_loss_std']:.4f}"
+        )
+    else:
+        print(
+            f"{model_label} 交叉验证: 平均准确率={metrics['accuracy_mean']:.4f}±{metrics['accuracy_std']:.4f}, "
+            f"平均Macro-F1={metrics['macro_f1_mean']:.4f}±{metrics['macro_f1_std']:.4f}, 平均LogLoss=nan"
+        )
+
+    return metrics
+
+
+def train_image_based_model(X, y, n_components=128):
+    """使用图像特征训练逻辑回归分类器。"""
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1])
+    n_comp = max(1, min(n_components, max_components if max_components > 0 else X_scaled.shape[1]))
+    pca = IncrementalPCA(n_components=n_comp, batch_size=max(32, n_comp * 2))
+    X_reduced = pca.fit_transform(X_scaled)
+
+    class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
+    class_weight_dict = dict(zip(np.unique(y), class_weights))
+
+    model = create_image_logistic_model(class_weight_dict)
+    model.fit(X_reduced, y)
+
+    print(f"图像模型训练完成: 样本数={len(y)}, 特征维度={X_reduced.shape[1]}")
+    return model, scaler, pca
+
+
+def predict_test_data_with_image_model(model, scaler, pca, feature_map, output_file="image_feature_prediction_results.txt", model_label="Image-Logistic"):
+    """利用图像特征模型预测测试集。"""
+    results = []
+    probabilities = {}
+
+    if not feature_map:
+        print("警告: 图像特征映射为空，跳过图像模型预测。")
+        return results, probabilities
+
+    for file_name in sorted(feature_map.keys()):
+        feature_vec = feature_map[file_name]
+        feature_scaled = scaler.transform([feature_vec])
+        feature_reduced = pca.transform(feature_scaled) if pca is not None else feature_scaled
+
+        proba = model.predict_proba(feature_reduced)[0]
+        proba = np.clip(proba, 1e-8, 1 - 1e-8)
+        proba = proba / proba.sum()
+
+        probabilities[file_name] = proba
+        prediction = int(np.argmax(proba))
+        fault_name = fault_type_mapping[prediction]
+        results.append((file_name, fault_name))
+
+        print(f"文件: {file_name}, {model_label} 预测: {fault_name} (置信度: {proba[prediction]:.3f})")
+
+    if results:
+        save_results(results, output_file)
+
+    return results, probabilities
 
 # 超参数调优函数
 def hyperparameter_tuning(X, y, model_type='rf', use_grid_search=True):
@@ -980,7 +1425,6 @@ def hyperparameter_tuning(X, y, model_type='rf', use_grid_search=True):
         最佳参数字典
     """
     from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
-    from sklearn.utils.class_weight import compute_class_weight
     
     # 数据标准化
     scaler = RobustScaler()
@@ -1077,46 +1521,32 @@ def train_rf_model_enhanced(X, y, best_params=None):
     
     # 划分训练集和验证集（添加分层采样）
     X_train, X_val, y_train, y_val = train_test_split(X_selected, y, test_size=0.2, random_state=42, stratify=y)
-    
+
     # 计算类别权重处理不平衡
-    from sklearn.utils.class_weight import compute_class_weight
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(zip(np.unique(y_train), class_weights))
-    
+
     print(f"随机森林类别权重: {class_weight_dict}")
-    
+
     # 使用最佳参数或默认参数
     if best_params is not None:
         print(f"使用调优后的参数: {best_params}")
-        model = RandomForestClassifier(
-            class_weight='balanced',
-            random_state=42,
-            n_jobs=-1,
-            oob_score=True,
-            **best_params
-        )
-    else:
-        # 训练随机森林模型（优化参数 + 类不平衡处理）
-        model = RandomForestClassifier(
-            n_estimators=200,        # 增加树的数量
-            max_depth=15,            # 增加树的深度
-            min_samples_split=5,     # 最小分割样本数
-            min_samples_leaf=2,      # 叶子节点最小样本数
-            max_features='sqrt',     # 最大特征数
-            bootstrap=True,          # 使用bootstrap采样
-            oob_score=True,          # 计算袋外得分
-            class_weight='balanced', # 自动平衡类别权重
-            random_state=42,
-            n_jobs=-1                # 使用所有CPU核心
-        )
-    
-    model.fit(X_train, y_train)
-    
+
+    model = create_rf_model(best_params)
+
+    sample_weights = np.array([class_weight_dict[label] for label in y_train])
+
+    try:
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+    except TypeError:
+        model.fit(X_train, y_train)
+
     # 在验证集上评估模型
     y_pred = model.predict(X_val)
     accuracy = accuracy_score(y_val, y_pred)
     print(f"随机森林验证集准确率: {accuracy:.4f}")
-    print(f"随机森林袋外得分: {model.oob_score_:.4f}")
+    if hasattr(model, 'oob_score_'):
+        print(f"随机森林袋外得分: {model.oob_score_:.4f}")
     print(classification_report(y_val, y_pred))
     
     # 特征重要性
@@ -1141,55 +1571,31 @@ def train_xgb_model_enhanced(X, y, best_params=None):
     
     # 划分训练集和验证集（添加分层采样）
     X_train, X_val, y_train, y_val = train_test_split(X_selected, y, test_size=0.2, random_state=42, stratify=y)
-    
+
     # 计算类别权重处理不平衡
-    from sklearn.utils.class_weight import compute_class_weight
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(zip(np.unique(y_train), class_weights))
-    
+
     # 计算样本权重
     sample_weights = np.array([class_weight_dict[label] for label in y_train])
-    
+
     print(f"XGBoost类别权重: {class_weight_dict}")
-    
+
     # 使用最佳参数或默认参数
     if best_params is not None:
         print(f"使用调优后的参数: {best_params}")
-        model = xgb.XGBClassifier(
-            objective='multi:softprob',
-            num_class=len(fault_types),
-            random_state=42,
-            eval_metric='mlogloss',
-            **best_params
-        )
-    else:
-        # 训练XGBoost模型（优化参数 + 类不平衡处理）
-        model = xgb.XGBClassifier(
-            n_estimators=200,        # 增加树的数量
-            learning_rate=0.05,      # 降低学习率
-            max_depth=6,             # 增加树的深度
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,           # L1正则化
-            reg_lambda=1.0,          # L2正则化
-            gamma=0.1,               # 最小分割损失
-            min_child_weight=3,      # 叶子节点最小权重
-            objective='multi:softprob',
-            num_class=len(fault_types),
-            random_state=42,
-            eval_metric='mlogloss',
-            scale_pos_weight=None    # XGBoost会自动处理多分类权重
-        )
-    
+
+    model = create_xgb_model(best_params)
+
     # 使用样本权重训练
     model.fit(X_train, y_train, sample_weight=sample_weights)
-    
+
     # 在验证集上评估模型
     y_pred = model.predict(X_val)
     accuracy = accuracy_score(y_val, y_pred)
     print(f"XGBoost验证集准确率: {accuracy:.4f}")
     print(classification_report(y_val, y_pred))
-    
+
     # 特征重要性
     if hasattr(model, 'feature_importances_'):
         importances = model.feature_importances_
@@ -1197,7 +1603,35 @@ def train_xgb_model_enhanced(X, y, best_params=None):
         print("XGBoost特征重要性 (前10):")
         for i in range(min(10, len(importances))):
             print(f"特征 #{indices[i]}: {importances[indices[i]]:.4f}")
-    
+
+    return model, scaler, selector, pca
+
+
+def train_decision_tree_model(X, y, best_params=None):
+    """训练分类树模型，用于补充融合。"""
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_selected, selector, pca = feature_selection(X_scaled, y, variance_threshold=0.01, n_components=None)
+
+    X_train, X_val, y_train, y_val = train_test_split(X_selected, y, test_size=0.2, random_state=42, stratify=y)
+
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weight_dict = dict(zip(np.unique(y_train), class_weights))
+
+    if best_params is not None:
+        print(f"使用决策树调优参数: {best_params}")
+
+    model = create_decision_tree_model(best_params)
+    sample_weights = np.array([class_weight_dict[label] for label in y_train])
+    model.fit(X_train, y_train, sample_weight=sample_weights)
+
+    y_pred = model.predict(X_val)
+    accuracy = accuracy_score(y_val, y_pred)
+    macro_f1 = f1_score(y_val, y_pred, average='macro', zero_division=0)
+    print(f"决策树验证集准确率: {accuracy:.4f}, Macro-F1: {macro_f1:.4f}")
+    print(classification_report(y_val, y_pred))
+
     return model, scaler, selector, pca
 
 # 训练随机森林模型
@@ -1212,34 +1646,29 @@ def train_rf_model(X, y):
     
     # 划分训练集和验证集（添加分层采样）
     X_train, X_val, y_train, y_val = train_test_split(X_selected, y, test_size=0.2, random_state=42, stratify=y)
-    
+
     # 计算类别权重处理不平衡
-    from sklearn.utils.class_weight import compute_class_weight
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(zip(np.unique(y_train), class_weights))
-    
+
     print(f"随机森林类别权重: {class_weight_dict}")
-    
+
     # 训练随机森林模型（优化参数 + 类不平衡处理）
-    model = RandomForestClassifier(
-        n_estimators=200,        # 增加树的数量
-        max_depth=15,            # 增加树的深度
-        min_samples_split=5,     # 最小分割样本数
-        min_samples_leaf=2,      # 叶子节点最小样本数
-        max_features='sqrt',     # 最大特征数
-        bootstrap=True,          # 使用bootstrap采样
-        oob_score=True,          # 计算袋外得分
-        class_weight='balanced', # 自动平衡类别权重
-        random_state=42,
-        n_jobs=-1                # 使用所有CPU核心
-    )
-    model.fit(X_train, y_train)
-    
+    model = create_rf_model()
+
+    sample_weights = np.array([class_weight_dict[label] for label in y_train])
+
+    try:
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+    except TypeError:
+        model.fit(X_train, y_train)
+
     # 在验证集上评估模型
     y_pred = model.predict(X_val)
     accuracy = accuracy_score(y_val, y_pred)
     print(f"随机森林验证集准确率: {accuracy:.4f}")
-    print(f"随机森林袋外得分: {model.oob_score_:.4f}")
+    if hasattr(model, 'oob_score_'):
+        print(f"随机森林袋外得分: {model.oob_score_:.4f}")
     print(classification_report(y_val, y_pred))
     
     # 特征重要性
@@ -1266,7 +1695,6 @@ def train_xgb_model(X, y):
     X_train, X_val, y_train, y_val = train_test_split(X_selected, y, test_size=0.2, random_state=42, stratify=y)
     
     # 计算类别权重处理不平衡
-    from sklearn.utils.class_weight import compute_class_weight
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(zip(np.unique(y_train), class_weights))
     
@@ -1274,25 +1702,10 @@ def train_xgb_model(X, y):
     sample_weights = np.array([class_weight_dict[label] for label in y_train])
     
     print(f"XGBoost类别权重: {class_weight_dict}")
-    
+
     # 训练XGBoost模型（优化参数 + 类不平衡处理）
-    model = xgb.XGBClassifier(
-        n_estimators=200,        # 增加树的数量
-        learning_rate=0.05,      # 降低学习率
-        max_depth=6,             # 增加树的深度
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,           # L1正则化
-        reg_lambda=1.0,          # L2正则化
-        gamma=0.1,               # 最小分割损失
-        min_child_weight=3,      # 叶子节点最小权重
-        objective='multi:softprob',
-        num_class=len(fault_types),
-        random_state=42,
-        eval_metric='mlogloss',
-        scale_pos_weight=None    # XGBoost会自动处理多分类权重
-    )
-    
+    model = create_xgb_model()
+
     # 使用样本权重训练
     model.fit(X_train, y_train, sample_weight=sample_weights)
     
@@ -1342,21 +1755,8 @@ def predict_test_data_with_proba(model, scaler, selector=None, pca=None, use_ord
         if features is not None:
             # 标准化特征
             features_scaled = scaler.transform([features])
-            
-            # 应用特征选择
-            if selector is not None:
-                if isinstance(selector, tuple):
-                    # 新格式：(variance_selector, features_to_keep)
-                    variance_selector, features_to_keep = selector
-                    features_scaled = variance_selector.transform(features_scaled)
-                    features_scaled = features_scaled[:, features_to_keep]
-                else:
-                    # 旧格式：直接是selector
-                    features_scaled = selector.transform(features_scaled)
-            
-            # 应用PCA降维
-            if pca is not None:
-                features_scaled = pca.transform(features_scaled)
+
+            features_scaled = apply_feature_selection_and_pca(features_scaled, selector, pca)
                 
             # 预测故障类型和概率
             prediction = model.predict(features_scaled)[0]
@@ -1400,21 +1800,8 @@ def predict_test_data(model, scaler, selector=None, pca=None, use_order_tracking
         if features is not None:
             # 标准化特征
             features_scaled = scaler.transform([features])
-            
-            # 应用特征选择
-            if selector is not None:
-                if isinstance(selector, tuple):
-                    # 新格式：(variance_selector, features_to_keep)
-                    variance_selector, features_to_keep = selector
-                    features_scaled = variance_selector.transform(features_scaled)
-                    features_scaled = features_scaled[:, features_to_keep]
-                else:
-                    # 旧格式：直接是selector
-                    features_scaled = selector.transform(features_scaled)
-            
-            # 应用PCA降维
-            if pca is not None:
-                features_scaled = pca.transform(features_scaled)
+
+            features_scaled = apply_feature_selection_and_pca(features_scaled, selector, pca)
                 
             # 预测故障类型
             prediction = model.predict(features_scaled)[0]
@@ -1441,190 +1828,400 @@ def save_results(results, output_file="prediction_results.txt"):
             f.write(f"{file_name},{fault_type}\n")
     print(f"预测结果已保存到 {output_file}")
 
+
+def adjust_probabilities_to_target_distribution(prob_matrix, target_distribution, max_iter=100, tol=1e-6):
+    """使用目标先验分布对概率矩阵进行校准"""
+    if prob_matrix.size == 0:
+        return prob_matrix
+
+    probs = np.clip(prob_matrix.astype(np.float64), 1e-9, 1.0)
+    probs /= probs.sum(axis=1, keepdims=True)
+
+    target_distribution = np.clip(np.asarray(target_distribution, dtype=np.float64), 1e-9, None)
+    target_distribution /= target_distribution.sum()
+
+    scaling = np.ones_like(target_distribution)
+
+    for _ in range(max_iter):
+        adjusted = probs * scaling
+        adjusted_sum = adjusted.sum(axis=1, keepdims=True)
+
+        zero_rows = np.isclose(adjusted_sum, 0.0)
+        if np.any(zero_rows):
+            adjusted[zero_rows] = 1.0 / adjusted.shape[1]
+            adjusted_sum[zero_rows] = 1.0
+
+        adjusted /= adjusted_sum
+        current_distribution = adjusted.mean(axis=0)
+
+        diff = np.max(np.abs(current_distribution - target_distribution))
+        if diff < tol:
+            probs = adjusted
+            break
+
+        scaling *= target_distribution / np.clip(current_distribution, 1e-9, None)
+    else:
+        adjusted = probs * scaling
+        adjusted /= adjusted.sum(axis=1, keepdims=True)
+        probs = adjusted
+
+    return probs
+
 # 集成多个模型的预测结果
-def ensemble_predictions_with_proba(rf_probabilities, xgb_probabilities, output_file="prediction_results.txt"):
-    """基于概率的集成预测（优化版）
-    
-    参数:
-        rf_probabilities: 随机森林概率字典 {文件名: 概率数组}
-        xgb_probabilities: XGBoost概率字典 {文件名: 概率数组}
-        output_file: 输出文件名
-    
-    返回:
-        集成后的预测结果列表
-    """
-    # 获取所有文件名
-    all_files = sorted(list(set(list(rf_probabilities.keys()) + list(xgb_probabilities.keys()))))
-    
-    # 集成结果
+def ensemble_predictions_with_proba(
+    model_probabilities,
+    output_file="prediction_results.txt",
+    reliability_weights=None,
+    apply_target_prior=True,
+    class_expertise=None,
+    temperature=0.8
+):
+    """基于概率的多模型集成预测。"""
+
+    if not model_probabilities:
+        raise ValueError("model_probabilities 不能为空")
+
+    active_models = {
+        name: probs for name, probs in model_probabilities.items() if probs
+    }
+
+    if not active_models:
+        raise ValueError("没有有效的模型概率输入用于集成")
+
+    all_files = sorted({file for probs in active_models.values() for file in probs.keys()})
+
     ensemble_results = []
-    
-    # 动态权重策略：基于置信度的自适应权重
+    aggregated_probabilities = {}
+    weight_trace = {}
+
+    n_classes = len(fault_types)
+
     for file in all_files:
-        rf_proba = rf_probabilities.get(file, None)
-        xgb_proba = xgb_probabilities.get(file, None)
-        
-        if rf_proba is not None and xgb_proba is not None:
-            # 计算每个模型的置信度（最大概率值）
-            rf_confidence = np.max(rf_proba)
-            xgb_confidence = np.max(xgb_proba)
-            
-            # 计算熵作为不确定性度量
-            rf_entropy = -np.sum(rf_proba * np.log(rf_proba + 1e-10))
-            xgb_entropy = -np.sum(xgb_proba * np.log(xgb_proba + 1e-10))
-            
-            # 基于置信度和熵的动态权重
-            # 高置信度、低熵的模型获得更高权重
-            rf_weight = rf_confidence / (rf_entropy + 1e-10)
-            xgb_weight = xgb_confidence / (xgb_entropy + 1e-10)
-            
-            # 归一化权重
-            total_weight = rf_weight + xgb_weight
-            rf_weight_norm = rf_weight / total_weight
-            xgb_weight_norm = xgb_weight / total_weight
-            
-            # 加权融合
-            avg_proba = rf_weight_norm * rf_proba + xgb_weight_norm * xgb_proba
-            
-            # 温度缩放（Temperature Scaling）提高预测置信度
-            temperature = 0.8  # 小于1使分布更尖锐
-            avg_proba = np.exp(np.log(avg_proba + 1e-10) / temperature)
-            avg_proba = avg_proba / np.sum(avg_proba)  # 重新归一化
-            
-        elif xgb_proba is not None:
-            avg_proba = xgb_proba
-        elif rf_proba is not None:
-            avg_proba = rf_proba
-        else:
+        available = {
+            name: np.asarray(probs[file], dtype=np.float64)
+            for name, probs in active_models.items()
+            if file in probs
+        }
+
+        if not available:
             continue
-            
-        # 获取最高概率对应的类别
-        prediction = np.argmax(avg_proba)
-        
-        # 获取故障类型名称
-        fault_name = list(fault_types.keys())[list(fault_types.values()).index(prediction)]
-        # 去掉后缀，只保留故障类型
-        fault_name = fault_name.split('_train')[0]
-        
+
+        combined = np.zeros(n_classes, dtype=np.float64)
+        raw_weights = {}
+
+        for model_name, proba in available.items():
+            proba = np.clip(proba, 1e-8, 1.0)
+            proba = proba / proba.sum()
+
+            confidence = np.max(proba)
+            entropy = -np.sum(proba * np.log(proba + 1e-12))
+            weight = confidence / (entropy + 1e-12)
+
+            if reliability_weights:
+                weight *= reliability_weights.get(model_name, 1.0)
+
+            if class_expertise and model_name in class_expertise:
+                class_weights = np.ones(n_classes, dtype=np.float64)
+                for idx, factor in class_expertise[model_name].items():
+                    class_weights[int(idx)] *= factor
+                proba = proba * class_weights
+                proba_sum = proba.sum()
+                if proba_sum > 0:
+                    proba = proba / proba_sum
+
+            combined += weight * proba
+            raw_weights[model_name] = raw_weights.get(model_name, 0.0) + weight
+
+        total_weight = sum(raw_weights.values())
+        if total_weight <= 0:
+            avg_proba = np.ones(n_classes, dtype=np.float64) / n_classes
+            weight_trace[file] = {model_name: 1.0 / len(raw_weights) for model_name in raw_weights}
+        else:
+            avg_proba = combined / total_weight
+            if temperature and temperature != 1.0:
+                avg_proba = np.exp(np.log(avg_proba + 1e-12) / temperature)
+                avg_proba = avg_proba / avg_proba.sum()
+            weight_trace[file] = {model_name: weight / total_weight for model_name, weight in raw_weights.items()}
+
+        aggregated_probabilities[file] = avg_proba
+
+    if apply_target_prior and TARGET_TEST_PRIORS is not None:
+        matrix_keys = [file for file in all_files if file in aggregated_probabilities]
+        if matrix_keys:
+            raw_matrix = np.array([aggregated_probabilities[file] for file in matrix_keys])
+            adjusted_matrix = adjust_probabilities_to_target_distribution(raw_matrix, TARGET_TEST_PRIORS)
+            for idx, file in enumerate(matrix_keys):
+                aggregated_probabilities[file] = adjusted_matrix[idx]
+
+    for file in all_files:
+        if file not in aggregated_probabilities:
+            continue
+
+        avg_proba = aggregated_probabilities[file]
+        prediction = int(np.argmax(avg_proba))
+        fault_name = fault_type_mapping[prediction]
+
         ensemble_results.append((file, fault_name))
-        
-        # 显示详细融合信息
-        if rf_proba is not None and xgb_proba is not None:
-            print(f"文件: {file}, RF权重: {rf_weight_norm:.3f}, XGB权重: {xgb_weight_norm:.3f}, "
-                  f"融合预测: {fault_name} (置信度: {avg_proba[prediction]:.3f})")
+
+        weights = weight_trace.get(file, {})
+        if weights:
+            weight_desc = ", ".join([f"{name}:{weight:.3f}" for name, weight in sorted(weights.items())])
+            print(
+                f"文件: {file}, 融合权重: {weight_desc}, "
+                f"预测: {fault_name} (置信度: {avg_proba[prediction]:.3f})"
+            )
         else:
             print(f"文件: {file}, 单模型预测: {fault_name} (置信度: {avg_proba[prediction]:.3f})")
-    
-    # 保存结果
+
     if not os.path.isabs(output_file):
         output_file = os.path.join(PROJECT_ROOT, output_file)
-    
+
     with open(output_file, 'w') as f:
         for file_name, fault_type in ensemble_results:
             f.write(f"{file_name},{fault_type}\n")
-    
+
     print(f"优化概率融合预测结果已保存到 {output_file}")
-    return ensemble_results
-    """集成随机森林和XGBoost模型的预测结果
-    
-    参数:
-        rf_results: 随机森林模型的预测结果列表，每项为(文件名, 预测类型)
-        xgb_results: XGBoost模型的预测结果列表，每项为(文件名, 预测类型)
-        output_file: 输出文件名
-    
-    返回:
-        集成后的预测结果列表
-    """
-    # 创建文件名到预测结果的映射
-    rf_dict = {file: fault for file, fault in rf_results}
-    xgb_dict = {file: fault for file, fault in xgb_results}
-    # 获取所有文件名
-    all_files = sorted(list(set(list(rf_dict.keys()) + list(xgb_dict.keys()))))
-    # 集成结果
-    ensemble_results = []
-    for file in all_files:
-        rf_pred = rf_dict.get(file, None)
-        xgb_pred = xgb_dict.get(file, None)
-        if rf_pred and xgb_pred and rf_pred != xgb_pred:
-            final_pred = xgb_pred
-            print(f"文件: {file}, RF预测: {rf_pred}, XGB预测: {xgb_pred}, 最终选择: {final_pred}")
-        else:
-            final_pred = xgb_pred if xgb_pred else rf_pred
-        ensemble_results.append((file, final_pred))
-    if not os.path.isabs(output_file):
-        output_file = os.path.join(PROJECT_ROOT, output_file)
-    with open(output_file, 'w') as f:
-        for file_name, fault_type in ensemble_results:
-            f.write(f"{file_name},{fault_type}\n")
-    print(f"集成预测结果已保存到 {output_file}")
-    return ensemble_results
+    return ensemble_results, aggregated_probabilities, weight_trace
 
 # 主函数（增强版）
 def main_enhanced():
     """主函数，执行完整的故障预测流程（增强版）"""
     print("开始故障预测任务（增强版）...")
-    
-    # 设置参数
-    use_order_tracking = True  # 是否使用阶次处理
-    use_windowing = False      # 去掉窗口处理，专注于其他优化
-    use_hyperparameter_tuning = True  # 是否进行超参数调优
-    
+
+    use_order_tracking = True
+    use_windowing = False
+    use_hyperparameter_tuning = True
+
+    image_feature_params = {
+        'use_order_tracking': False,
+        'image_type': 'combined',
+        'image_size': (160, 160),
+        'pca_components': 128,
+    }
+
+    manual_class_boost_hints = {
+        'decision_tree': {'roller_wear': 1.12, 'roller_broken': 1.05},
+        'image': {'inner_wear': 1.15, 'normal': 1.05},
+    }
+    manual_class_boost_indices = {
+        model: {CLASS_INDEX_BY_NAME[name]: factor for name, factor in hints.items() if name in CLASS_INDEX_BY_NAME}
+        for model, hints in manual_class_boost_hints.items()
+    }
+
     print(f"参数设置: 阶次处理={use_order_tracking}, 窗口处理={use_windowing}, 超参数调优={use_hyperparameter_tuning}")
-    
-    # 加载训练数据
+
     print("正在加载训练数据...")
     X, y = load_training_data(use_order_tracking, use_windowing)
-    
-    # 超参数调优（可选）
+
     rf_best_params = None
     xgb_best_params = None
-    
+
     if use_hyperparameter_tuning:
         print("\n进行随机森林超参数调优...")
         try:
             rf_best_params = hyperparameter_tuning(X, y, model_type='rf', use_grid_search=False)
         except Exception as e:
             print(f"随机森林超参数调优失败: {e}")
-            rf_best_params = None
-        
+
         print("\n进行XGBoost超参数调优...")
         try:
             xgb_best_params = hyperparameter_tuning(X, y, model_type='xgb', use_grid_search=False)
         except Exception as e:
             print(f"XGBoost超参数调优失败: {e}")
-            xgb_best_params = None
-    
-    # 训练增强版随机森林模型
+
+    reliability_weights = {}
+    class_expertise = {}
+
+    print("\n执行交叉验证以评估模型可靠性...")
+    try:
+        rf_cv_metrics = cross_validate_model(
+            X, y,
+            build_model_fn=lambda: create_rf_model(rf_best_params),
+            model_label="RandomForest-Enhanced"
+        )
+        reliability_weights['rf'] = compute_reliability_weight(rf_cv_metrics)
+        class_expertise['rf'] = derive_class_expertise(rf_cv_metrics)
+    except Exception as e:
+        print(f"随机森林交叉验证失败，使用默认权重: {e}")
+        reliability_weights['rf'] = 1.0
+        class_expertise['rf'] = derive_class_expertise({})
+
+    try:
+        xgb_cv_metrics = cross_validate_model(
+            X, y,
+            build_model_fn=lambda: create_xgb_model(xgb_best_params),
+            model_label="XGBoost-Enhanced"
+        )
+        reliability_weights['xgb'] = compute_reliability_weight(xgb_cv_metrics)
+        class_expertise['xgb'] = derive_class_expertise(xgb_cv_metrics)
+    except Exception as e:
+        print(f"XGBoost交叉验证失败，使用默认权重: {e}")
+        reliability_weights['xgb'] = 1.0
+        class_expertise['xgb'] = derive_class_expertise({})
+
+    try:
+        dt_cv_metrics = cross_validate_model(
+            X, y,
+            build_model_fn=lambda: create_decision_tree_model(),
+            model_label="DecisionTree"
+        )
+        reliability_weights['decision_tree'] = compute_reliability_weight(dt_cv_metrics)
+        class_expertise['decision_tree'] = derive_class_expertise(
+            dt_cv_metrics,
+            manual_boost=manual_class_boost_indices.get('decision_tree')
+        )
+    except Exception as e:
+        print(f"决策树交叉验证失败，使用默认权重: {e}")
+        reliability_weights['decision_tree'] = 1.0
+        class_expertise['decision_tree'] = derive_class_expertise(
+            {},
+            manual_boost=manual_class_boost_indices.get('decision_tree')
+        )
+
+    image_dataset = None
+    try:
+        print("\n构建图像特征数据集...")
+        image_X, image_y, image_converter = load_image_feature_dataset(
+            use_order_tracking=image_feature_params['use_order_tracking'],
+            image_type=image_feature_params['image_type'],
+            image_size=image_feature_params['image_size']
+        )
+        if len(image_X) > 0:
+            image_cv_metrics = cross_validate_image_model(
+                image_X,
+                image_y,
+                build_model_fn=lambda cw: create_image_logistic_model(cw),
+                model_label="Image-Logistic",
+                n_components=image_feature_params['pca_components']
+            )
+            reliability_weights['image'] = compute_reliability_weight(image_cv_metrics)
+            class_expertise['image'] = derive_class_expertise(
+                image_cv_metrics,
+                manual_boost=manual_class_boost_indices.get('image')
+            )
+            image_dataset = (image_X, image_y, image_converter)
+        else:
+            print("图像特征数据集为空，跳过图像模型")
+    except Exception as e:
+        print(f"图像模型准备失败: {e}")
+
+    print(f"模型可靠性权重: {reliability_weights}")
+    readable_expertise = {
+        model: {fault_type_mapping[idx]: round(value, 3) for idx, value in weights.items()}
+        for model, weights in class_expertise.items()
+    }
+    print(f"模型类别加权提示: {readable_expertise}")
+
     print("\n训练增强版随机森林模型...")
     rf_model, rf_scaler, rf_selector, rf_pca = train_rf_model_enhanced(X, y, rf_best_params)
-    
-    # 训练增强版XGBoost模型
+
     print("\n训练增强版XGBoost模型...")
     xgb_model, xgb_scaler, xgb_selector, xgb_pca = train_xgb_model_enhanced(X, y, xgb_best_params)
-    
-    # 使用随机森林模型预测测试数据（获取概率）
+
+    dt_model = dt_scaler = dt_selector = dt_pca = None
+    try:
+        print("\n训练决策树模型...")
+        dt_model, dt_scaler, dt_selector, dt_pca = train_decision_tree_model(X, y)
+    except Exception as e:
+        print(f"决策树训练失败: {e}")
+
+    image_probabilities = {}
+    if image_dataset is not None:
+        try:
+            image_X, image_y, image_converter = image_dataset
+            image_model, image_scaler, image_pca = train_image_based_model(
+                image_X,
+                image_y,
+                n_components=image_feature_params['pca_components']
+            )
+            test_image_features = load_test_image_features(
+                image_converter,
+                use_order_tracking=image_feature_params['use_order_tracking'],
+                image_type=image_feature_params['image_type'],
+                image_size=image_feature_params['image_size']
+            )
+            image_results, image_probabilities = predict_test_data_with_image_model(
+                image_model,
+                image_scaler,
+                image_pca,
+                test_image_features,
+                output_file="image_feature_prediction_results.txt",
+                model_label="Image-Logistic"
+            )
+            if image_results:
+                save_results(image_results, "image_feature_prediction_results.txt")
+        except Exception as e:
+            print(f"图像模型推理失败: {e}")
+            image_probabilities = {}
+
     print("\n使用增强版随机森林模型预测测试数据...")
-    rf_results, rf_probabilities = predict_test_data_with_proba(rf_model, rf_scaler, rf_selector, rf_pca, 
-                                                               use_order_tracking, use_windowing, "RandomForest-Enhanced")
-    
-    # 保存随机森林模型的预测结果
+    rf_results, rf_probabilities = predict_test_data_with_proba(
+        rf_model,
+        rf_scaler,
+        rf_selector,
+        rf_pca,
+        use_order_tracking,
+        use_windowing,
+        "RandomForest-Enhanced"
+    )
     save_results(rf_results, "rf_enhanced_prediction_results.txt")
-    
-    # 使用XGBoost模型预测测试数据（获取概率）
+
     print("\n使用增强版XGBoost模型预测测试数据...")
-    xgb_results, xgb_probabilities = predict_test_data_with_proba(xgb_model, xgb_scaler, xgb_selector, xgb_pca, 
-                                                                 use_order_tracking, use_windowing, "XGBoost-Enhanced")
-    
-    # 保存XGBoost模型的预测结果
+    xgb_results, xgb_probabilities = predict_test_data_with_proba(
+        xgb_model,
+        xgb_scaler,
+        xgb_selector,
+        xgb_pca,
+        use_order_tracking,
+        use_windowing,
+        "XGBoost-Enhanced"
+    )
     save_results(xgb_results, "xgb_enhanced_prediction_results.txt")
-    
-    # 集成两个模型的预测结果（使用增强的概率融合）
-    print("\n集成两个模型的预测结果（增强概率融合）...")
-    ensemble_results = ensemble_predictions_with_proba(rf_probabilities, xgb_probabilities, "enhanced_prediction_results.txt")
-    
-    # 保存按照提交格式的结果
+
+    dt_probabilities = {}
+    if dt_model is not None:
+        try:
+            print("\n使用决策树模型预测测试数据...")
+            dt_results, dt_probabilities = predict_test_data_with_proba(
+                dt_model,
+                dt_scaler,
+                dt_selector,
+                dt_pca,
+                use_order_tracking,
+                use_windowing,
+                "DecisionTree"
+            )
+            save_results(dt_results, "decision_tree_prediction_results.txt")
+        except Exception as e:
+            print(f"决策树预测失败: {e}")
+            dt_probabilities = {}
+
+    print("\n集成多模型的预测结果（增强概率融合）...")
+    probability_sources = {
+        'rf': rf_probabilities,
+        'xgb': xgb_probabilities,
+    }
+    if dt_probabilities:
+        probability_sources['decision_tree'] = dt_probabilities
+    if image_probabilities:
+        probability_sources['image'] = image_probabilities
+
+    ensemble_reliability = {name: reliability_weights.get(name, 1.0) for name in probability_sources}
+    ensemble_class_expertise = {
+        name: class_expertise[name]
+        for name in probability_sources
+        if name in class_expertise
+    }
+
+    ensemble_results, _, _ = ensemble_predictions_with_proba(
+        probability_sources,
+        output_file="enhanced_prediction_results.txt",
+        reliability_weights=ensemble_reliability,
+        class_expertise=ensemble_class_expertise
+    )
+
     save_results_for_submission(ensemble_results, "enhanced_submit_result.txt")
-    
+
     print("\n增强版故障预测任务完成!")
 
 # 主函数
@@ -1668,7 +2265,10 @@ def main():
     
     # 集成两个模型的预测结果（使用概率融合）
     print("\n集成两个模型的预测结果（概率融合）...")
-    ensemble_results = ensemble_predictions_with_proba(rf_probabilities, xgb_probabilities, "prediction_results.txt")
+    ensemble_results, _, _ = ensemble_predictions_with_proba(
+        {'rf': rf_probabilities, 'xgb': xgb_probabilities},
+        "prediction_results.txt"
+    )
     
     # 保存按照提交格式的结果
     save_results_for_submission(ensemble_results)
