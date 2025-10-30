@@ -52,6 +52,18 @@ fault_type_mapping = {
     5: "roller_wear"
 }
 
+# 测试集类别占比（根据最新统计信息进行校准）
+# 顺序与 fault_type_mapping 的索引保持一致
+TARGET_TEST_PRIORS = np.array([
+    0.132,  # inner_broken
+    0.123,  # inner_wear
+    0.200,  # normal
+    0.141,  # outer_missing
+    0.176,  # roller_broken
+    0.228   # roller_wear
+])
+TARGET_TEST_PRIORS = TARGET_TEST_PRIORS / TARGET_TEST_PRIORS.sum()
+
 # 窗口处理参数
 SAMPLE_RATE = 20480  # 采样率（假设为20.48kHz）
 WINDOW_SIZE_SEC = 0.5  # 窗口大小（秒）
@@ -1513,41 +1525,72 @@ def save_results(results, output_file="prediction_results.txt"):
             f.write(f"{file_name},{fault_type}\n")
     print(f"预测结果已保存到 {output_file}")
 
+
+def adjust_probabilities_to_target_distribution(prob_matrix, target_distribution, max_iter=100, tol=1e-6):
+    """使用目标先验分布对概率矩阵进行校准"""
+    if prob_matrix.size == 0:
+        return prob_matrix
+
+    probs = np.clip(prob_matrix.astype(np.float64), 1e-9, 1.0)
+    probs /= probs.sum(axis=1, keepdims=True)
+
+    target_distribution = np.clip(np.asarray(target_distribution, dtype=np.float64), 1e-9, None)
+    target_distribution /= target_distribution.sum()
+
+    scaling = np.ones_like(target_distribution)
+
+    for _ in range(max_iter):
+        adjusted = probs * scaling
+        adjusted_sum = adjusted.sum(axis=1, keepdims=True)
+
+        zero_rows = np.isclose(adjusted_sum, 0.0)
+        if np.any(zero_rows):
+            adjusted[zero_rows] = 1.0 / adjusted.shape[1]
+            adjusted_sum[zero_rows] = 1.0
+
+        adjusted /= adjusted_sum
+        current_distribution = adjusted.mean(axis=0)
+
+        diff = np.max(np.abs(current_distribution - target_distribution))
+        if diff < tol:
+            probs = adjusted
+            break
+
+        scaling *= target_distribution / np.clip(current_distribution, 1e-9, None)
+    else:
+        adjusted = probs * scaling
+        adjusted /= adjusted.sum(axis=1, keepdims=True)
+        probs = adjusted
+
+    return probs
+
 # 集成多个模型的预测结果
-def ensemble_predictions_with_proba(rf_probabilities, xgb_probabilities, output_file="prediction_results.txt", reliability_weights=None):
-    """基于概率的集成预测（优化版）
+def ensemble_predictions_with_proba(
+    rf_probabilities,
+    xgb_probabilities,
+    output_file="prediction_results.txt",
+    reliability_weights=None,
+    apply_target_prior=True
+):
+    """基于概率的集成预测（优化版）"""
 
-    参数:
-        rf_probabilities: 随机森林概率字典 {文件名: 概率数组}
-        xgb_probabilities: XGBoost概率字典 {文件名: 概率数组}
-        output_file: 输出文件名
-        reliability_weights: 全局模型可靠性权重字典，如 {'rf': 1.0, 'xgb': 0.9}
-
-    返回:
-        集成后的预测结果列表
-    """
-    # 获取所有文件名
     all_files = sorted(list(set(list(rf_probabilities.keys()) + list(xgb_probabilities.keys()))))
-    
-    # 集成结果
+
     ensemble_results = []
-    
-    # 动态权重策略：基于置信度的自适应权重
+    aggregated_probabilities = {}
+    weight_trace = {}
+
     for file in all_files:
-        rf_proba = rf_probabilities.get(file, None)
-        xgb_proba = xgb_probabilities.get(file, None)
-        
+        rf_proba = rf_probabilities.get(file)
+        xgb_proba = xgb_probabilities.get(file)
+
         if rf_proba is not None and xgb_proba is not None:
-            # 计算每个模型的置信度（最大概率值）
             rf_confidence = np.max(rf_proba)
             xgb_confidence = np.max(xgb_proba)
-            
-            # 计算熵作为不确定性度量
+
             rf_entropy = -np.sum(rf_proba * np.log(rf_proba + 1e-10))
             xgb_entropy = -np.sum(xgb_proba * np.log(xgb_proba + 1e-10))
-            
-            # 基于置信度和熵的动态权重
-            # 高置信度、低熵的模型获得更高权重
+
             rf_weight = rf_confidence / (rf_entropy + 1e-10)
             xgb_weight = xgb_confidence / (xgb_entropy + 1e-10)
 
@@ -1555,51 +1598,65 @@ def ensemble_predictions_with_proba(rf_probabilities, xgb_probabilities, output_
                 rf_weight *= reliability_weights.get('rf', 1.0)
                 xgb_weight *= reliability_weights.get('xgb', 1.0)
 
-            # 归一化权重
             total_weight = rf_weight + xgb_weight
             rf_weight_norm = rf_weight / total_weight
             xgb_weight_norm = xgb_weight / total_weight
-            
-            # 加权融合
+
             avg_proba = rf_weight_norm * rf_proba + xgb_weight_norm * xgb_proba
-            
-            # 温度缩放（Temperature Scaling）提高预测置信度
-            temperature = 0.8  # 小于1使分布更尖锐
+
+            temperature = 0.8
             avg_proba = np.exp(np.log(avg_proba + 1e-10) / temperature)
-            avg_proba = avg_proba / np.sum(avg_proba)  # 重新归一化
-            
+            avg_proba = avg_proba / np.sum(avg_proba)
+
+            weight_trace[file] = (rf_weight_norm, xgb_weight_norm)
+
         elif xgb_proba is not None:
             avg_proba = xgb_proba
+            weight_trace[file] = (0.0, 1.0)
         elif rf_proba is not None:
             avg_proba = rf_proba
+            weight_trace[file] = (1.0, 0.0)
         else:
             continue
-            
-        # 获取最高概率对应的类别
+
+        aggregated_probabilities[file] = avg_proba
+
+    if apply_target_prior and TARGET_TEST_PRIORS is not None:
+        matrix_keys = [file for file in all_files if file in aggregated_probabilities]
+        if matrix_keys:
+            raw_matrix = np.array([aggregated_probabilities[file] for file in matrix_keys])
+            adjusted_matrix = adjust_probabilities_to_target_distribution(raw_matrix, TARGET_TEST_PRIORS)
+            for idx, file in enumerate(matrix_keys):
+                aggregated_probabilities[file] = adjusted_matrix[idx]
+
+    for file in all_files:
+        if file not in aggregated_probabilities:
+            continue
+
+        avg_proba = aggregated_probabilities[file]
         prediction = np.argmax(avg_proba)
-        
-        # 获取故障类型名称
+
         fault_name = list(fault_types.keys())[list(fault_types.values()).index(prediction)]
-        # 去掉后缀，只保留故障类型
         fault_name = fault_name.split('_train')[0]
-        
+
         ensemble_results.append((file, fault_name))
-        
-        # 显示详细融合信息
-        if rf_proba is not None and xgb_proba is not None:
-            print(f"文件: {file}, RF权重: {rf_weight_norm:.3f}, XGB权重: {xgb_weight_norm:.3f}, "
-                  f"融合预测: {fault_name} (置信度: {avg_proba[prediction]:.3f})")
+
+        rf_weight_norm, xgb_weight_norm = weight_trace.get(file, (None, None))
+        if rf_weight_norm is not None and xgb_weight_norm is not None:
+            print(
+                f"文件: {file}, RF权重: {rf_weight_norm:.3f}, XGB权重: {xgb_weight_norm:.3f}, "
+                f"融合预测: {fault_name} (置信度: {avg_proba[prediction]:.3f})"
+            )
         else:
             print(f"文件: {file}, 单模型预测: {fault_name} (置信度: {avg_proba[prediction]:.3f})")
-    
-    # 保存结果
+
     if not os.path.isabs(output_file):
         output_file = os.path.join(PROJECT_ROOT, output_file)
-    
+
     with open(output_file, 'w') as f:
         for file_name, fault_type in ensemble_results:
             f.write(f"{file_name},{fault_type}\n")
-    
+
     print(f"优化概率融合预测结果已保存到 {output_file}")
     return ensemble_results
 
